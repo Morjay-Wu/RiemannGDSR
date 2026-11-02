@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Model checkpoints & logs
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+checkpoints/
+runs/
+logs/
+*.log
+
+# Datasets & archives
+data/
+*.zip
+*.tar
+*.tar.gz
+*.h5
+*.mat
+
+# Local & legacy scratch directories
+.agents/
+ORIGINAL_REQUEST.md
+run_remote.py
+verify_general_cv_models.py
+cvpr2/
+docs/
+epicycle_scd/
+epinadir_cd/
+riemann_stf/
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
