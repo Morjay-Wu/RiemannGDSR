@@ -130,6 +130,7 @@ class BaseGDSRDataset(Dataset):
             self.samples = self._load_sample_list()
 
         self.is_synthetic = synthetic or len(self.samples) == 0
+        self._mem_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     def _load_sample_list(self) -> List[Dict[str, str]]:
         """Subclasses should implement real data indexing.
@@ -257,18 +258,39 @@ class BaseGDSRDataset(Dataset):
             meta = {"index": idx, "is_synthetic": True, "scale": self.scale}
         else:
             sample = self.samples[idx]
-            rgb = load_rgb_tensor(sample['rgb_path'], self.img_size)
-            d_gt = load_depth_tensor(sample['depth_path'], self.img_size, self.depth_scale)
-            mask_gt = (d_gt > 0.001).float()
-
-            if 'lr_depth_path' in sample and os.path.isfile(sample['lr_depth_path']):
-                lr_size = (self.img_size[0] // self.scale, self.img_size[1] // self.scale)
-                d_lr = load_depth_tensor(sample['lr_depth_path'], lr_size, self.depth_scale)
-                mask_lr = (d_lr > 0.001).float()
+            if idx in self._mem_cache:
+                rgb, d_gt, d_lr, mask_gt, mask_lr = [t.clone() for t in self._mem_cache[idx]]
             else:
-                d_lr, mask_lr = self._simulate_degradation(d_gt)
+                rgb = load_rgb_tensor(sample['rgb_path'], self.img_size)
+                d_gt = load_depth_tensor(sample['depth_path'], self.img_size, self.depth_scale)
+                mask_gt = (d_gt > 0.001).float()
+
+                if 'lr_depth_path' in sample and os.path.isfile(sample['lr_depth_path']):
+                    lr_size = (self.img_size[0] // self.scale, self.img_size[1] // self.scale)
+                    d_lr = load_depth_tensor(sample['lr_depth_path'], lr_size, self.depth_scale)
+                    mask_lr = (d_lr > 0.001).float()
+                else:
+                    d_lr, mask_lr = self._simulate_degradation(d_gt)
+
+                if len(self._mem_cache) < 1200:
+                    self._mem_cache[idx] = (rgb.clone(), d_gt.clone(), d_lr.clone(), mask_gt.clone(), mask_lr.clone())
 
             if self.split == 'train':
+                # Scale-aligned 256x256 random crop for fast high-diversity training
+                crop_h, crop_w = 256, 256
+                h_lr, w_lr = d_lr.shape[-2], d_lr.shape[-1]
+                ch_lr, cw_lr = crop_h // self.scale, crop_w // self.scale
+                if h_lr > ch_lr and w_lr > cw_lr:
+                    top_lr = random.randint(0, h_lr - ch_lr)
+                    left_lr = random.randint(0, w_lr - cw_lr)
+                    top_hr = top_lr * self.scale
+                    left_hr = left_lr * self.scale
+                    rgb = rgb[:, top_hr : top_hr + crop_h, left_hr : left_hr + crop_w]
+                    d_gt = d_gt[:, top_hr : top_hr + crop_h, left_hr : left_hr + crop_w]
+                    mask_gt = mask_gt[:, top_hr : top_hr + crop_h, left_hr : left_hr + crop_w]
+                    d_lr = d_lr[:, top_lr : top_lr + ch_lr, left_lr : left_lr + cw_lr]
+                    mask_lr = mask_lr[:, top_lr : top_lr + ch_lr, left_lr : left_lr + cw_lr]
+
                 if random.random() < 0.5:
                     rgb = torch.flip(rgb, dims=[-1])
                     d_gt = torch.flip(d_gt, dims=[-1])

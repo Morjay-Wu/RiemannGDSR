@@ -258,7 +258,7 @@ def main():
     cfg = RiemannGDSRConfig(
         num_steps=args.num_steps,
         feature_dim=args.feature_dim,
-        use_checkpoint=True,
+        use_checkpoint=(args.batch_size == 1),
     )
     model = RiemannGDSRNet(config=cfg).to(device)
 
