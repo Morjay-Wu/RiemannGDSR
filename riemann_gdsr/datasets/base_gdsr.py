@@ -268,6 +268,20 @@ class BaseGDSRDataset(Dataset):
             else:
                 d_lr, mask_lr = self._simulate_degradation(d_gt)
 
+            if self.split == 'train':
+                if random.random() < 0.5:
+                    rgb = torch.flip(rgb, dims=[-1])
+                    d_gt = torch.flip(d_gt, dims=[-1])
+                    d_lr = torch.flip(d_lr, dims=[-1])
+                    mask_gt = torch.flip(mask_gt, dims=[-1])
+                    mask_lr = torch.flip(mask_lr, dims=[-1])
+                if random.random() < 0.5:
+                    rgb = torch.flip(rgb, dims=[-2])
+                    d_gt = torch.flip(d_gt, dims=[-2])
+                    d_lr = torch.flip(d_lr, dims=[-2])
+                    mask_gt = torch.flip(mask_gt, dims=[-2])
+                    mask_lr = torch.flip(mask_lr, dims=[-2])
+
             meta = {
                 "index": idx,
                 "is_synthetic": False,

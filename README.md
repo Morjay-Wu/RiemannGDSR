@@ -1,6 +1,7 @@
 # RiemannGDSR: Spectral Screened-Poisson $\mathbb{S}^2_+$ Surface-Normal Geodesic Unrolling for Guided Depth Map Super-Resolution
 
 **Authors:** Tongquan Wu, Yuanxu Wang, Lu Bai, Xu Liu, and Yurong Qian* (*Corresponding author)  
+**Repository:** [https://github.com/Morjay-Wu/RiemannGDSR.git](https://github.com/Morjay-Wu/RiemannGDSR.git)  
 **Funding:** Supported by National Natural Science Foundation of China (62266043) — *"Key Technologies of Space-Air-Ground Multi-Modal Data Fusion for Digital Twin Agriculture"*.
 
 ---
@@ -62,6 +63,8 @@ RiemannGDSR/
 ## Installation
 
 ```bash
+git clone https://github.com/Morjay-Wu/RiemannGDSR.git
+cd RiemannGDSR
 conda create -n pytorch python=3.10 -y
 conda activate pytorch
 pip install -r requirements.txt

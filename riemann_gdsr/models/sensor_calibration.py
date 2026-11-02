@@ -214,10 +214,8 @@ class SensorCalibration(nn.Module):
             raw_full = F.interpolate(raw, size=(H, W), mode="bilinear", align_corners=False)
 
             raw_alpha, raw_beta = torch.chunk(raw_full, 2, dim=1)
-            raw_alpha = 3.0 * torch.tanh(raw_alpha / 3.0)
-            raw_beta = 2.0 * torch.tanh(raw_beta / 2.0)
-            alpha = F.softplus(raw_alpha + self.offset_c0) + self.eps_alpha
-            beta = raw_beta
+            alpha = 1.0 + 0.02 * torch.tanh(raw_alpha)
+            beta = 0.02 * torch.tanh(raw_beta)
         return alpha, beta
 
     def estimate_psf_kernel(
@@ -305,12 +303,15 @@ class SensorCalibration(nn.Module):
         K_spatial: torch.Tensor,
         scale_factor: int,
         mask_lr: torch.Tensor | None = None,
+        soft_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Range-Null Space Consistency Projection:
         D^(k) = A_phi^dagger D_lr + P_Null(D_Poisson)
               = D_Poisson + A_phi^dagger(D_lr - A_phi D_Poisson).
         Guarantees A_phi(D^(k)) == D_lr on valid LR measurements without staircase artifacts.
+        When `soft_gate` is provided during unrolling, uses edge-insulated smooth bicubic
+        range back-projection to prevent block boundary halos across depth discontinuities.
         """
         H, W = D_Poisson.shape[-2:]
         with torch.amp.autocast(device_type=D_Poisson.device.type, enabled=False):
@@ -324,8 +325,12 @@ class SensorCalibration(nn.Module):
 
             deg_p = self.apply_A(D_Poisson_f, K_f, scale_factor, mask_lr_f)
             res_lr = (D_lr_f - deg_p) * mask_lr_f
-            delta_HR = self.apply_A_dagger(res_lr, K_f, scale_factor, (H, W), mask_lr_f)
-            D_k = D_Poisson_f + delta_HR
+            if soft_gate is None:
+                delta_HR = self.apply_A_dagger(res_lr, K_f, scale_factor, (H, W), mask_lr_f)
+                D_k = D_Poisson_f + delta_HR
+            else:
+                delta_smooth = F.interpolate(res_lr, size=(H, W), mode="bicubic", align_corners=False)
+                D_k = D_Poisson_f + soft_gate.float() * delta_smooth
         return D_k.type_as(D_Poisson)
 
     def forward(
@@ -360,12 +365,11 @@ class SensorCalibration(nn.Module):
             alpha, beta = self.calibrate_scale_shift(rgb_feat_f, d_lr_filled, (H, W))
             k_spatial = self.estimate_psf_kernel(rgb_feat_f, d_lr_filled)
 
-            # Smooth bicubic back-projected warm-start D^(0)
+            # Smooth bicubic warm-start D^(0) with single gentle range-consistency correction
             d_0_raw = F.interpolate(d_lr_filled, size=(H, W), mode="bicubic", align_corners=False)
-            for _ in range(2):
-                deg_0 = self.apply_A(d_0_raw, k_spatial, scale_factor, mask_lr_f)
-                res_0 = (d_lr_filled - deg_0) * mask_lr_f
-                d_0_raw = d_0_raw + F.interpolate(res_0, size=(H, W), mode="bicubic", align_corners=False)
+            deg_0 = self.apply_A(d_0_raw, k_spatial, scale_factor, mask_lr_f)
+            res_0 = (d_lr_filled - deg_0) * mask_lr_f
+            d_0_raw = d_0_raw + 0.5 * F.interpolate(res_0, size=(H, W), mode="bicubic", align_corners=False)
 
             d_0 = torch.clamp(alpha * d_0_raw + beta, min=1e-3)
 

@@ -36,9 +36,27 @@ class RiemannGDSRConfig:
     use_checkpoint: bool = True
 
 
+class SEChannelAttention(nn.Module):
+    """Lightweight Squeeze-and-Excitation channel attention."""
+
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, mid, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mid, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.fc(self.pool(x))
+
+
 class ResidualGuidanceBlock(nn.Module):
     """
-    Edge-preserving multi-dilation residual block for RGB guidance feature extraction.
+    Edge-preserving multi-dilation residual block with channel attention for RGB/Depth feature extraction.
     """
 
     def __init__(self, channels: int):
@@ -48,16 +66,17 @@ class ResidualGuidanceBlock(nn.Module):
         self.conv_context = nn.Conv2d(channels, channels - half, kernel_size=3, padding=2, dilation=2)
         self.act = nn.GELU()
         self.fuse = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.ca = SEChannelAttention(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = torch.cat([self.conv_local(x), self.conv_context(x)], dim=1)
-        h = self.fuse(self.act(h))
+        h = self.ca(self.fuse(self.act(h)))
         return x + h
 
 
 class RGBGuidanceEncoder(nn.Module):
     """
-    Lightweight multi-scale RGB structural feature encoder.
+    Lightweight multi-scale RGB structural feature encoder (full + 1/2 + 1/4 context pyramid).
     """
 
     def __init__(self, in_channels: int = 3, feature_dim: int = 48):
@@ -69,7 +88,13 @@ class RGBGuidanceEncoder(nn.Module):
         )
         self.block1 = ResidualGuidanceBlock(feature_dim)
         self.block2 = ResidualGuidanceBlock(feature_dim)
-        self.out_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1)
+        self.ctx_half = ResidualGuidanceBlock(feature_dim)
+        self.ctx_quarter = ResidualGuidanceBlock(feature_dim)
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(feature_dim * 2, feature_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
+        )
 
     @staticmethod
     def _rgb_gradients(rgb: torch.Tensor) -> torch.Tensor:
@@ -80,11 +105,61 @@ class RGBGuidanceEncoder(nn.Module):
         return torch.cat([gx, gy], dim=1)
 
     def forward(self, rgb: torch.Tensor) -> torch.Tensor:
+        H, W = rgb.shape[-2:]
         grad_xy = self._rgb_gradients(rgb)
         x = self.stem(torch.cat([rgb, grad_xy], dim=1))
         x = self.block1(x)
-        x = self.block2(x)
-        return self.out_proj(x)
+        x_fine = self.block2(x)
+
+        # Multi-scale context pyramid for large scale factors (x8, x16)
+        x_d2 = F.avg_pool2d(x_fine, kernel_size=2, stride=2)
+        x_d2 = self.ctx_half(x_d2)
+        x_d4 = F.avg_pool2d(x_d2, kernel_size=2, stride=2)
+        x_d4 = self.ctx_quarter(x_d4)
+        x_ctx = F.interpolate(x_d2, size=(H, W), mode="bilinear", align_corners=False) + F.interpolate(
+            x_d4, size=(H, W), mode="bilinear", align_corners=False
+        )
+        return x_fine + self.out_proj(torch.cat([x_fine, x_ctx], dim=1))
+
+
+class MultiScaleDetailRefiner(nn.Module):
+    """
+    Scale-invariant multi-scale RGB-D detail refiner and edge-insulated range-null gate predictor.
+    """
+
+    def __init__(self, in_dim: int, c_dim: int):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_dim, c_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        self.fine_block = ResidualGuidanceBlock(c_dim)
+        self.coarse_block = ResidualGuidanceBlock(c_dim)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(c_dim * 2, c_dim, kernel_size=1),
+            nn.GELU(),
+            ResidualGuidanceBlock(c_dim),
+        )
+        self.delta_head = nn.Conv2d(c_dim, 1, kernel_size=3, padding=1)
+        self.gate_head = nn.Conv2d(c_dim, 1, kernel_size=3, padding=1)
+        self.res_scale = nn.Parameter(torch.tensor(0.15))
+
+        nn.init.normal_(self.delta_head.weight, mean=0.0, std=1e-4)
+        nn.init.zeros_(self.delta_head.bias)
+        nn.init.zeros_(self.gate_head.weight)
+        nn.init.constant_(self.gate_head.bias, 0.5)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        H, W = x.shape[-2:]
+        feat = self.stem(x)
+        f_fine = self.fine_block(feat)
+        f_sub = F.avg_pool2d(f_fine, kernel_size=2, stride=2)
+        f_sub = self.coarse_block(f_sub)
+        f_up = F.interpolate(f_sub, size=(H, W), mode="bilinear", align_corners=False)
+        f_out = self.fuse(torch.cat([f_fine, f_up], dim=1))
+        delta = self.res_scale * torch.tanh(self.delta_head(f_out))
+        gate = torch.sigmoid(self.gate_head(f_out))
+        return delta, gate
 
 
 class RiemannianUnrollingStep(nn.Module):
@@ -93,18 +168,17 @@ class RiemannianUnrollingStep(nn.Module):
     1. Predict raw normal update -> Project onto T_{n^(k-1)} S^2 -> Levi-Civita Parallel Transport ->
        Geodesic Exponential Retraction to obtain n^(k) in S^2_+.
     2. Solve Spectral Screened-Poisson PDE via 2D FFT -> RGB-Guided Detail Residual Coupling ->
-       Apply Range-Null Space Projection P_Null to obtain D^(k).
+       Apply Edge-Insulated Range-Null Space Projection P_Null to obtain D^(k).
     """
 
     def __init__(self, config: RiemannGDSRConfig):
         super().__init__()
         c_dim = config.feature_dim
-        # Input to tangent predictor: RGB features (c_dim) + current depth (1) + current normal (3)
+        # Input to tangent predictor: RGB features (c_dim) + norm depth (1) + norm range res (1) + normal (3)
         self.tangent_update_net = nn.Sequential(
-            nn.Conv2d(c_dim + 4, c_dim, kernel_size=3, padding=1),
+            nn.Conv2d(c_dim + 5, c_dim, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(c_dim, c_dim, kernel_size=3, padding=1),
-            nn.GELU(),
+            ResidualGuidanceBlock(c_dim),
             nn.Conv2d(c_dim, 3, kernel_size=3, padding=1),
         )
         # Initialize update head with small weights for smooth initial geodesic trajectory
@@ -117,15 +191,8 @@ class RiemannianUnrollingStep(nn.Module):
         self.poisson_solver = ScreenedPoissonRangeNullSolver(default_lambda=config.screen_lambda)
 
         # High-frequency RGB-guided depth detail refinement head prior to Range-Null projection
-        self.detail_head = nn.Sequential(
-            nn.Conv2d(c_dim + 5, c_dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(c_dim, c_dim // 2, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(c_dim // 2, 1, kernel_size=3, padding=1),
-        )
-        nn.init.normal_(self.detail_head[-1].weight, mean=0.0, std=1e-3)
-        nn.init.zeros_(self.detail_head[-1].bias)
+        # Input: f_rgb (c_dim) + d_poisson_norm (1) + d_prev_norm (1) + res_norm (1) + n_k (3) = c_dim + 6
+        self.detail_head = MultiScaleDetailRefiner(in_dim=c_dim + 6, c_dim=c_dim)
 
     def forward(
         self,
@@ -139,19 +206,35 @@ class RiemannianUnrollingStep(nn.Module):
         mask_lr: torch.Tensor,
         sensor_calib: SensorCalibration,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        H, W = d_prev.shape[-2:]
+        # Per-sample scale-invariant normalization frame
+        d_min = d_prev.amin(dim=(-2, -1), keepdim=True).detach()
+        d_max = d_prev.amax(dim=(-2, -1), keepdim=True).detach()
+        d_span = (d_max - d_min).clamp_min(1e-2)
+        d_prev_norm = (d_prev - d_min) / d_span
+
+        # Smooth bicubic LR measurement residual feedback
+        deg_prev = sensor_calib.apply_A(d_prev, k_spatial, scale_factor, mask_lr)
+        res_lr_prev = (d_lr - deg_prev) * mask_lr
+        res_up_bic = F.interpolate(res_lr_prev.float(), size=(H, W), mode="bicubic", align_corners=False).type_as(d_prev)
+        res_norm = torch.clamp(res_up_bic / d_span, min=-2.0, max=2.0)
+
         # Step 1: Manifold Tangent Space Update on S^2_+
-        inp = torch.cat([f_rgb, d_prev, n_prev], dim=1)
+        inp = torch.cat([f_rgb, d_prev_norm, res_norm, n_prev], dim=1)
         v_raw = self.tangent_update_net(inp)
         v_perp = self.tangent_proj(v_raw, n_prev)
-        v_trans = self.parallel_transport(v_perp, n_prev, rgb, d_prev)
+        v_trans = self.parallel_transport(v_perp, n_prev, rgb, d_prev_norm)
         n_k = self.retraction(n_prev, v_trans)
 
-        # Step 2: Spectral Screened-Poisson + Guided Detail Coupling + Range-Null Space Projection
+        # Step 2: Spectral Screened-Poisson + Multi-Scale Detail Coupling + Edge-Insulated Range-Null Projection
         d_poisson = self.poisson_solver.forward_step(n_k, d_prev)
-        detail_inp = torch.cat([f_rgb, d_poisson, d_prev, n_k], dim=1)
-        delta_detail = self.detail_head(detail_inp)
-        d_candidate = torch.clamp(d_poisson + delta_detail, min=1e-3)
-        d_k = sensor_calib.project_range_null(d_candidate, d_lr, k_spatial, scale_factor, mask_lr)
+        d_poisson_norm = (d_poisson - d_min) / d_span
+        detail_inp = torch.cat([f_rgb, d_poisson_norm, d_prev_norm, res_norm, n_k], dim=1)
+        delta_norm, range_gate = self.detail_head(detail_inp)
+        d_candidate = torch.clamp(d_poisson + delta_norm * d_span, min=1e-3)
+        d_k = sensor_calib.project_range_null(
+            d_candidate, d_lr, k_spatial, scale_factor, mask_lr, soft_gate=range_gate
+        )
         d_k = torch.clamp(d_k, min=1e-3)
 
         return n_k, d_k

@@ -30,6 +30,7 @@ class ScreenedPoissonRangeNullSolver(nn.Module):
         # Learnable positive screening parameter lambda initialized at default_lambda
         init_raw = math.log(math.exp(default_lambda) - 1.0)
         self.raw_lambda = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
+        self.poisson_step = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
 
     @property
     def screen_lambda(self) -> torch.Tensor:
@@ -108,19 +109,26 @@ class ScreenedPoissonRangeNullSolver(nn.Module):
             d_anchor_f = d_anchor.float()
             lam = self.screen_lambda.float()
 
-            div_g = self.compute_divergence(gx_f, gy_f)
-            rhs = lam * d_anchor_f - div_g
+            # Compute anchor central differences so unchanged normals produce zero frequency attenuation
+            pad_d = F.pad(d_anchor_f, (1, 1, 1, 1), mode="replicate")
+            gx_anchor = (pad_d[:, :, 1:-1, 2:] - pad_d[:, :, 1:-1, :-2]) * 0.5
+            gy_anchor = (pad_d[:, :, 2:, 1:-1] - pad_d[:, :, :-2, 1:-1]) * 0.5
 
-            rhs_hat = torch.fft.rfft2(rhs)  # [B, 1, H, W//2 + 1]
+            div_dg = self.compute_divergence(gx_f - gx_anchor, gy_f - gy_anchor)
+            rhs_hat = -torch.fft.rfft2(div_dg)  # [B, 1, H, W//2 + 1]
 
-            # 2D discrete Laplacian Fourier symbol: 4 - 2 cos(wx) - 2 cos(wy)
+            # Exact central-difference Laplacian Fourier symbol: sin^2(wx) + sin^2(wy)
             wy = 2.0 * math.pi * torch.fft.fftfreq(H, device=device, dtype=torch.float32).view(1, 1, H, 1)
             wx = 2.0 * math.pi * torch.fft.rfftfreq(W, device=device, dtype=torch.float32).view(1, 1, 1, W // 2 + 1)
-            lap_symbol = 4.0 - 2.0 * torch.cos(wx) - 2.0 * torch.cos(wy)
+            lap_symbol = torch.sin(wx) ** 2 + torch.sin(wy) ** 2
 
             denom = lap_symbol + lam
-            d_poisson_hat = rhs_hat / denom
-            d_poisson = torch.fft.irfft2(d_poisson_hat, s=(H, W))
+            delta_hat = rhs_hat / denom
+            delta_d = torch.fft.irfft2(delta_hat, s=(H, W))
+            delta_d = delta_d - delta_d.mean(dim=(-2, -1), keepdim=True)
+
+            step_w = torch.sigmoid(self.poisson_step.float()) * 0.5
+            d_poisson = d_anchor_f + step_w * delta_d
 
             # Enforce non-negative valid depth
             d_poisson = torch.clamp(d_poisson, min=1e-3)
